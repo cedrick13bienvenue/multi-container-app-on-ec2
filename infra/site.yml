@@ -12,9 +12,9 @@
       changed_when: true
 
     # `creates` makes this idempotent — skips if /usr/bin/docker already exists
-    - name: Install Docker
+    - name: Install Docker and Git
       ansible.builtin.command:
-        cmd: yum install -y docker
+        cmd: yum install -y docker git
         creates: /usr/bin/docker
       changed_when: true
 
@@ -37,9 +37,11 @@
         state: directory
         mode: "0755"
 
+    # Pinned to v2.29.1 — Compose v5+ requires buildx which is not available on AL2.
+    # v2.x builds images using the legacy Docker builder, no buildx dependency.
     - name: Download Docker Compose v2 binary
       ansible.builtin.get_url:
-        url: https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64
+        url: https://github.com/docker/compose/releases/download/v2.29.1/docker-compose-linux-x86_64
         dest: /usr/local/lib/docker/cli-plugins/docker-compose
         mode: "0755"
 

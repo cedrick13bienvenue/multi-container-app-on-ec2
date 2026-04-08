@@ -1,39 +1,47 @@
-# Multi-Container App on EC2 — Flask + MySQL with Docker Compose
+# Multi-Container App on EC2 — Flask + MySQL with Docker Compose, Terraform & Ansible
 
 ## Overview
 
 This lab solves a classic production problem: **how do you run an application and its database as isolated, reproducible services that start and stop together, with zero manual wiring?**
 
-A single EC2 instance running a bare app process is fragile — the database URL is hardcoded, the process dies on reboot, and there is no clear boundary between app and data. Docker Compose addresses this by declaring both the Flask API and the MySQL database as first-class services inside a shared internal network. The app never sees the host; it reaches the database by service name. Credentials are injected at runtime from a `.env` file that is never committed.
+A single EC2 instance running a bare app process is fragile — the database URL is hardcoded, the process dies on reboot, and there is no clear boundary between app and data. This project addresses that by combining three tools:
 
-The result is a two-tier architecture that starts with one command, verifies itself through health checks, and is torn down completely — including all data — with one cleanup command.
+- **Terraform** provisions the EC2 infrastructure (VPC, subnet, security group, key pair) with a remote backend for state management
+- **Ansible** configures the instance over SSH — installs Docker, Docker Compose, and Git automatically
+- **Docker Compose** declares the Flask API and MySQL database as first-class services in a shared internal network, started with one command
+
+The result is a fully automated two-tier architecture: infrastructure as code, configuration as code, and application deployment as code.
 
 ---
 
 ## Objectives
 
-- Provision an EC2 instance (Amazon Linux 2, t2.micro) and install Docker + Docker Compose v2
-- Build a Flask API that reads from and writes to a MySQL database
-- Declare both services in a single `docker-compose.yml` with environment variable injection, named networks, and volume mounts
-- Gate the web service startup on a MySQL health check so the app never races the database
-- Run the full lifecycle: `up --build` → verify with `curl` → `down --volumes`
-- Keep credentials out of version control with `.env` + `.gitignore`
+- Provision EC2 (Amazon Linux 2, t3.micro) with Terraform using a remote S3 backend + DynamoDB state lock
+- Auto-generate `inventory.ini` from Terraform output — no manual IP hardcoding
+- Configure Docker + Docker Compose on the instance via Ansible over SSH
+- Deploy a Flask API backed by MySQL using Docker Compose
+- Gate web service startup on a MySQL health check — no startup race condition
+- Keep all credentials in `.env`, gitignored and never committed
+- Run the full lifecycle: `up --build` → verify with `curl` → `down --volumes` → `terraform destroy`
 
 ---
 
 ## Tools & Versions
 
-| Tool             | Version       |
-|------------------|---------------|
-| Docker           | v27.x         |
-| Docker Compose   | v2.x (plugin) |
-| Python           | 3.11-slim     |
-| Flask            | 3.0.3         |
-| MySQL            | 8.0           |
-| EC2 AMI          | Amazon Linux 2|
-| Instance Type    | t2.micro      |
-| Region           | eu-north-1    |
-| OS (local)       | macOS         |
+| Tool             | Version        |
+|------------------|----------------|
+| Terraform        | >= 1.5.0       |
+| AWS Provider     | ~> 5.0         |
+| Ansible          | 2.x            |
+| Docker           | 25.0.14        |
+| Docker Compose   | v2.29.1        |
+| Python           | 3.11-slim      |
+| Flask            | 3.0.3          |
+| MySQL            | 8.0            |
+| EC2 AMI          | Amazon Linux 2 |
+| Instance Type    | t3.micro       |
+| Region           | eu-north-1     |
+| OS (local)       | macOS          |
 
 ---
 
@@ -44,28 +52,35 @@ Running an application and a database on the same host without containerization 
 - **Environment drift** — works on one machine, breaks on another
 - **Tight coupling** — app and DB start/stop manually, in no guaranteed order
 - **Secret sprawl** — credentials embedded in source code or shell history
-- **Cleanup pain** — leftover data volumes and processes after a lab session
+- **Manual provisioning** — every new server requires manual SSH steps to install dependencies
 
-Docker Compose eliminates all four problems. It declares the full topology — services, networks, volumes, env vars, health checks — in a single version-controlled file. A fresh EC2 instance reproduces the exact same running state every time.
+Terraform + Ansible + Docker Compose eliminates all four. The full topology — infrastructure, server configuration, services, networks, volumes, env vars, health checks — is declared in version-controlled files. A fresh EC2 instance reproduces the exact same running state every time.
 
 ---
 
 ## Architecture
 
 ```
-EC2 Instance (Amazon Linux 2)
-└── Docker Engine
-    └── Compose Project: multi-container-app
-        ├── Service: web  (Flask, port 5000 → host)
-        │     └── reads DB_HOST / DB_USER / DB_PASSWORD / DB_NAME from .env
-        └── Service: db   (MySQL 8.0, internal only)
-              ├── healthcheck: mysqladmin ping
-              └── init volume: ./db/init.sql → seeds schema + sample data
-        [app-net] — internal bridge network; web reaches db by hostname "db"
-        [db-data] — named volume; MySQL data persists across restarts
+YOUR MACHINE
+│
+├── Terraform → provisions EC2 + networking on AWS
+│               writes inventory.ini with real EC2 IP
+│
+└── Ansible   → SSHes into EC2, installs Docker + Compose + Git
+                  ↓
+              EC2 Instance (Amazon Linux 2, t3.micro)
+              └── Docker Engine
+                  └── Compose Project: multi-container-app
+                      ├── Service: web  (Flask, port 5000 → host)
+                      │     └── reads DB credentials from .env
+                      └── Service: db   (MySQL 8.0, internal only)
+                            ├── healthcheck: mysqladmin ping
+                            └── init volume: db/init.sql → seeds schema
+                      [app-net] — internal bridge network
+                      [db-data] — named volume, persists MySQL data
 ```
 
-The `db` service is **not** published on any host port. Only `web` exposes port 5000. This means the database is unreachable from outside the Docker network — a key security boundary.
+The `db` service is **not** published on any host port — MySQL is unreachable from outside the Docker network.
 
 ---
 
@@ -75,205 +90,260 @@ The `db` service is **not** published on any host port. Only `web` exposes port 
 multi-container-app-on-ec2/
 ├── docker-compose.yml       # Declares both services, network, volumes
 ├── .env.example             # Credential template — copy to .env before running
-├── .gitignore               # Excludes .env and Python bytecode
+├── .gitignore               # Excludes .env, keys/, Terraform state, Python bytecode
 ├── README.md                # This file
 ├── web/
 │   ├── Dockerfile           # Builds the Flask image (non-root user)
 │   ├── app.py               # Flask application with DB-backed endpoints
 │   └── requirements.txt     # Flask + mysql-connector-python
-└── db/
-    └── init.sql             # Creates users table and seeds 3 rows
+├── db/
+│   └── init.sql             # Creates users table and seeds 3 rows
+├── infra/
+│   ├── backend/             # Stage 1 — bootstraps S3 + DynamoDB (local state)
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   └── outputs.tf
+│   ├── main.tf              # Stage 2 — EC2 infrastructure + auto-generates inventory.ini
+│   ├── variables.tf
+│   ├── outputs.tf
+│   └── site.yml             # Ansible playbook — installs Docker, Compose, Git
+├── keys/                    # SSH key pair — gitignored, never committed
+└── screenshoots/            # Evidence screenshots
 ```
 
 ---
 
 ## API Endpoints
 
-| Method | Path           | Description                          |
-|--------|----------------|--------------------------------------|
-| GET    | `/`            | Welcome message + endpoint list      |
-| GET    | `/health`      | Liveness + DB connectivity check     |
-| GET    | `/users`       | Returns all users from MySQL         |
-| GET    | `/users/<id>`  | Returns a single user by primary key |
+| Method | Path          | Description                          |
+|--------|---------------|--------------------------------------|
+| GET    | `/`           | Welcome message + endpoint list      |
+| GET    | `/health`     | Liveness + DB connectivity check     |
+| GET    | `/users`      | Returns all users from MySQL         |
+| GET    | `/users/<id>` | Returns a single user by primary key |
 
 ---
 
 ## Security Considerations
 
-- The Flask container runs as a **non-root user** (`app`) — privilege escalation from inside the container is blocked
-- The `db` service is **not exposed** on any host port — MySQL is only reachable within the `app-net` bridge network
-- All credentials live in `.env`, which is listed in `.gitignore` and never committed
-- The `init.sql` volume mount is **read-only** (`:ro`) — the container cannot modify the seed script at runtime
-- The MySQL image uses parameterised queries (`%s` placeholders) throughout the Flask app — no SQL injection surface
+- Flask container runs as a **non-root user** (`app`) — no privilege escalation from inside the container
+- `db` service is **not exposed** on any host port — MySQL only reachable within `app-net`
+- All credentials live in `.env`, listed in `.gitignore`, never committed
+- `init.sql` volume mount is **read-only** (`:ro`)
+- Parameterised queries (`%s` placeholders) throughout — no SQL injection surface
+- SSH access restricted to a single IP (`/32`) via the security group
+- S3 state bucket has versioning enabled, public access blocked, encryption at rest
 
 ---
 
 ## Prerequisites
 
-1. An AWS account with access to EC2 (Free Tier eligible)
-2. A key pair to SSH into the instance
-3. Security group with inbound rules:
-   - Port 22 (SSH) from your IP
-   - Port 5000 (Flask) from your IP (or 0.0.0.0/0 for lab purposes)
+1. Terraform >= 1.5.0
+2. Ansible installed locally
+3. AWS CLI configured (`aws configure`)
+4. An AWS account (Free Tier eligible)
 
 ---
 
 ## Usage
 
-### 1 — Provision EC2 and Install Docker
-
-Launch a **t2.micro Amazon Linux 2** instance, SSH in, then run:
+### 0 — Generate SSH Key (once)
 
 ```bash
-sudo yum update -y
-
-# Install Docker
-sudo amazon-linux-extras install docker -y
-sudo service docker start
-sudo usermod -aG docker ec2-user
-
-# Install Docker Compose v2 plugin
-DOCKER_CONFIG=${DOCKER_CONFIG:-$HOME/.docker}
-mkdir -p $DOCKER_CONFIG/cli-plugins
-curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 \
-  -o $DOCKER_CONFIG/cli-plugins/docker-compose
-chmod +x $DOCKER_CONFIG/cli-plugins/docker-compose
-
-# Re-login so group membership takes effect
-exit
+ssh-keygen -t ed25519 -f keys/app -N ""
 ```
 
-SSH back in, then verify:
-
-```bash
-docker --version
-docker compose version
-```
+Creates `keys/app` (private) and `keys/app.pub` (public). Both are gitignored.
 
 ---
 
-### 2 — Clone the Repository
+### Stage 1 — Bootstrap the Remote Backend
 
 ```bash
-git clone <your-repo-url>
-cd multi-container-app-on-ec2
+cd infra/backend
+terraform init
+terraform apply
 ```
+
+Creates the S3 bucket and DynamoDB table that will store and lock Terraform state for the main config.
+
+> This config uses **local state** intentionally — you cannot store state in a bucket you haven't created yet.
+
+![Backend Terraform Apply](screenshoots/01-backend-terraform-apply.png)
 
 ---
 
-### 3 — Configure Credentials
+### Stage 2 — Deploy EC2 Infrastructure
 
 ```bash
-cp .env.example .env
-nano .env   # replace all change_me_* values with real passwords
+cd ..
+terraform init
 ```
 
-The `.env` file is listed in `.gitignore` — it is never committed.
+Downloads the AWS + local providers and connects to the S3 remote backend.
+
+![Terraform Init](screenshoots/02-terraform-init.png)
+
+```bash
+terraform fmt
+terraform validate
+```
+
+![Terraform Validate](screenshoots/03-terraform-validate.png)
+
+```bash
+terraform apply -var="my_ip=$(curl -s https://checkip.amazonaws.com)/32"
+```
+
+Creates VPC, subnet, IGW, route table, security group, key pair, and EC2 instance. Also writes `inventory.ini` automatically with the real EC2 public IP.
+
+![Terraform Apply Complete](screenshoots/04-terraform-apply-complete.png)
 
 ---
 
-### 4 — Build and Start
+### Stage 3 — Configure the Instance with Ansible
+
+Wait ~30 seconds for EC2 to finish booting, then:
 
 ```bash
+ansible-playbook -i inventory.ini site.yml
+```
+
+Ansible connects over SSH and installs Docker, Docker Compose v2.29.1, and Git. All tasks run without `sudo docker` requirement — `ec2-user` is added to the docker group.
+
+![Ansible Playbook Complete](screenshoots/12-ansible-playbook-complete.png)
+
+---
+
+### Stage 4 — Run Locally First (Verify Before EC2)
+
+Before deploying to EC2, verify the app works on your local machine:
+
+```bash
+cd ..   # back to project root
 docker compose up --build -d
+docker compose ps
 ```
 
-Docker Compose will:
-1. Build the `web` image from `./web/Dockerfile`
-2. Pull `mysql:8.0`
-3. Start `db`, wait for the MySQL health check to pass
-4. Start `web` only after `db` is healthy
-
-Watch startup logs:
+![Local Compose Up and PS](screenshoots/06-local-compose-up-ps.png)
 
 ```bash
-docker compose logs -f
-```
-
----
-
-### 5 — Verify
-
-```bash
-# Welcome message
 curl http://localhost:5000
-
-# DB connectivity
 curl http://localhost:5000/health
-
-# All users (seeded by init.sql)
 curl http://localhost:5000/users
-
-# Single user
 curl http://localhost:5000/users/1
 ```
 
-From outside EC2 (replace with your instance's public IP):
+![Local Curl Responses](screenshoots/07-local-curl-responses.png)
 
 ```bash
-curl http://<EC2-PUBLIC-IP>:5000/users
+docker compose logs
 ```
 
----
-
-### 6 — Teardown
+![Local Compose Logs](screenshoots/08-local-compose-logs.png)
 
 ```bash
 docker compose down --volumes
 ```
 
-This stops and removes both containers, the `app-net` network, and the `db-data` volume — the EC2 host is left clean.
+---
+
+### Stage 5 — Deploy on EC2
+
+```bash
+cd infra
+ssh -i ../keys/app ec2-user@$(terraform output -raw ec2_public_ip)
+```
+
+Inside EC2:
+
+```bash
+git clone https://github.com/cedrick13bienvenue/multi-container-app-on-ec2
+cd multi-container-app-on-ec2
+cp .env.example .env
+nano .env    # fill in real passwords
+docker compose up --build -d
+```
+
+![EC2 Git Clone and Compose Up](screenshoots/09-ec2-git-clone-compose-up.png)
+
+```bash
+docker compose ps
+```
+
+![EC2 Compose PS](screenshoots/10-ec2-compose-ps.png)
+
+```bash
+curl http://localhost:5000
+curl http://localhost:5000/health
+curl http://localhost:5000/users
+curl http://localhost:5000/users/1
+docker compose logs
+```
+
+![EC2 Compose Logs](screenshoots/11-ec2-compose-logs.png)
+
+![EC2 Curl Responses and Compose Down](screenshoots/13-ec2-curl-compose-down.png)
 
 ---
 
-## Evidence
+### Stage 6 — Teardown
 
-### Docker and Docker Compose Installed
+```bash
+# On EC2
+docker compose down --volumes
+exit
 
-![Docker and Compose versions](screenshoots/01-docker-compose-version.png)
+# On local machine — destroy EC2 infrastructure
+cd infra
+terraform destroy -var="my_ip=$(curl -s https://checkip.amazonaws.com)/32"
 
-### Compose Up — Services Starting
+# Destroy the backend last
+cd backend
+terraform destroy
+```
 
-![docker compose up output](screenshoots/02-compose-up.png)
+![Terraform Destroy Backend](screenshoots/14-terraform-destroy-backend.png)
 
-### Services Running
+> **Order matters** — always destroy main infra before the backend. Destroying the backend first removes the state file and Terraform loses track of what to destroy.
 
-![docker compose ps](screenshoots/03-compose-ps.png)
+---
 
-### Health Check Passing
+## Resources Deployed
 
-![curl /health](screenshoots/04-curl-health.png)
+| Resource         | Name                              | Details                              |
+|------------------|-----------------------------------|--------------------------------------|
+| VPC              | multi-container-app-vpc           | CIDR: 10.0.0.0/16, DNS hostnames on  |
+| Public Subnet    | multi-container-app-public-subnet | CIDR: 10.0.1.0/24, eu-north-1a       |
+| Internet Gateway | multi-container-app-igw           | Attached to VPC                      |
+| Route Table      | multi-container-app-public-rt     | Route: 0.0.0.0/0 → IGW               |
+| Security Group   | multi-container-app-sg            | SSH (22) from my IP, Flask (5000)    |
+| Key Pair         | multi-container-app-key           | Ed25519, registered from local key   |
+| EC2 Instance     | multi-container-app-ec2           | t3.micro, Amazon Linux 2             |
 
-### Root Endpoint
+---
 
-![curl /](screenshoots/05-curl-root.png)
+## Remote Backend
 
-### Users Endpoint — Data from MySQL
+| Component      | Name                              | Purpose                            |
+|----------------|-----------------------------------|------------------------------------|
+| S3 Bucket      | cedrick-multi-container-state-2026 | Stores terraform.tfstate file     |
+| DynamoDB Table | multi-container-lock              | State locking (prevents conflicts) |
 
-![curl /users](screenshoots/06-curl-users.png)
-
-### Single User Endpoint
-
-![curl /users/1](screenshoots/07-curl-users-id.png)
-
-### Compose Logs
-
-![docker compose logs](screenshoots/08-compose-logs.png)
-
-### Teardown — Down with Volumes
-
-![docker compose down --volumes](screenshoots/09-compose-down-volumes.png)
+State file path in S3: `multi-container-app/terraform.tfstate`
 
 ---
 
 ## Key Design Decisions
 
-**Health check gates startup** — `depends_on: condition: service_healthy` ensures the Flask container never attempts a DB connection before MySQL has finished initializing. Without this, the app crashes on first start and requires a manual restart.
+**Health check gates startup** — `depends_on: condition: service_healthy` ensures Flask never attempts a DB connection before MySQL has finished initializing. Without this, the app crashes on first start and requires a manual restart.
 
-**Named internal network** — Both services share `app-net`, a dedicated bridge network. The `db` service is not published on the host, so MySQL is only reachable by name (`db`) from within the network — not from the internet or even other Docker projects on the same host.
+**Ansible over user_data** — `user_data` runs blind: no live output, can't be re-run, can't tell which step failed. Ansible gives task-by-task output, idempotency, and can be re-run at any time against any instance.
 
-**Non-root container user** — The Flask image creates a system user `app` and drops to it before the process starts. If the container is ever compromised, the attacker has no root access to the host filesystem.
+**Inventory auto-generated by Terraform** — the `local_file` resource writes `inventory.ini` with the real EC2 IP after `terraform apply`. No manual copy-pasting of IPs between tools.
 
-**Volume for init SQL** — Mounting `init.sql` into `/docker-entrypoint-initdb.d/` is the official MySQL image convention for seeding. It runs exactly once — when the data directory is empty — and is ignored on subsequent starts, so restart-safe.
+**Docker Compose v2.29.1 pinned** — Compose v5+ requires Docker Buildx, which is not bundled with Docker 25 on Amazon Linux 2. v2.29.1 uses the legacy builder with no external dependency.
 
-**`.env` for secrets** — No credentials appear in `docker-compose.yml` or any committed file. The compose file uses `${VAR}` substitution, and Docker Compose automatically reads `.env` from the project root. `.env.example` serves as a self-documenting template.
+**Named internal network** — the `db` service is not published on the host. MySQL is only reachable by service name (`db`) from within `app-net` — not from the internet or other Docker projects on the same host.
+
+**Non-root container user** — the Flask image creates a system user `app` and drops to it before the process starts. If the container is compromised, the attacker has no root access to the host filesystem.
