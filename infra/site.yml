@@ -1,0 +1,66 @@
+---
+- name: Install Docker and Docker Compose on EC2
+  hosts: app
+  become: true
+
+  tasks:
+    # ansible.builtin.yum and dnf modules both require Python bindings that are
+    # absent on Amazon Linux 2 (Python 3.7). ansible.builtin.command runs the
+    # binary directly — no Python package bindings needed.
+    - name: Update all packages
+      ansible.builtin.command: yum update -y
+      changed_when: true
+
+    # `creates` makes this idempotent — skips if /usr/bin/docker already exists
+    - name: Install Docker
+      ansible.builtin.command:
+        cmd: yum install -y docker
+        creates: /usr/bin/docker
+      changed_when: true
+
+    - name: Start and enable Docker
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: true
+
+    # Without this, every docker command requires sudo
+    - name: Add ec2-user to docker group
+      ansible.builtin.user:
+        name: ec2-user
+        groups: docker
+        append: true
+
+    - name: Create Docker CLI plugins directory
+      ansible.builtin.file:
+        path: /usr/local/lib/docker/cli-plugins
+        state: directory
+        mode: "0755"
+
+    - name: Download Docker Compose v2 binary
+      ansible.builtin.get_url:
+        url: https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64
+        dest: /usr/local/lib/docker/cli-plugins/docker-compose
+        mode: "0755"
+
+    - name: Symlink docker-compose for legacy compatibility
+      ansible.builtin.file:
+        src: /usr/local/lib/docker/cli-plugins/docker-compose
+        dest: /usr/local/bin/docker-compose
+        state: link
+
+    - name: Verify Docker version
+      ansible.builtin.command: docker --version
+      register: docker_version
+      changed_when: false
+
+    - name: Verify Docker Compose version
+      ansible.builtin.command: docker compose version
+      register: compose_version
+      changed_when: false
+
+    - name: Print installed versions
+      ansible.builtin.debug:
+        msg:
+          - "{{ docker_version.stdout }}"
+          - "{{ compose_version.stdout }}"
