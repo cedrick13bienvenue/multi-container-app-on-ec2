@@ -163,13 +163,19 @@ multi-container-app-on-ec2/
 
 ## Usage
 
-### 0 — Generate SSH Key (once)
+### Step 0 — Generate Your SSH Key
 
 ```bash
+cd multi-container-app-on-ec2
 ssh-keygen -t ed25519 -f keys/app -N ""
 ```
 
-Creates `keys/app` (private) and `keys/app.pub` (public). Both are gitignored.
+Creates two files:
+
+- `keys/app` — private key, stays on your machine forever, never committed
+- `keys/app.pub` — public key, Terraform uploads this to AWS
+
+EC2 instances don't have passwords. AWS uses key pairs — you prove identity by holding the private key. Ansible also uses this key to SSH in and configure the server.
 
 ---
 
@@ -178,12 +184,20 @@ Creates `keys/app` (private) and `keys/app.pub` (public). Both are gitignored.
 ```bash
 cd infra/backend
 terraform init
+```
+
+Downloads the AWS provider locally. State is stored locally in `.terraform/` at this stage — intentionally, because the S3 bucket doesn't exist yet.
+
+```bash
 terraform apply
 ```
 
-Creates the S3 bucket and DynamoDB table that will store and lock Terraform state for the main config.
+Type `yes`. Creates two AWS resources in eu-west-1:
 
-> This config uses **local state** intentionally — you cannot store state in a bucket you haven't created yet.
+| Resource | Purpose |
+|----------|---------|
+| S3 bucket `cedrick-multi-container-state-2026` | Stores `terraform.tfstate` remotely |
+| DynamoDB table `multi-container-lock` | Locks state during apply — prevents corruption |
 
 ![Backend Terraform Apply](screenshoots/01-backend-terraform-apply.png)
 
@@ -192,11 +206,15 @@ Creates the S3 bucket and DynamoDB table that will store and lock Terraform stat
 ### Stage 2 — Deploy EC2 Infrastructure
 
 ```bash
-cd ../../terra-modules
+cd ../terra-modules
 terraform init
 ```
 
-Downloads the AWS + local providers and connects to the S3 remote backend.
+Downloads the AWS + local providers and connects to the S3 backend you just created. You'll see:
+
+```
+Successfully configured the backend "s3"!
+```
 
 ![Terraform Init](screenshoots/02-terraform-init.png)
 
@@ -205,19 +223,47 @@ terraform fmt
 terraform validate
 ```
 
+`fmt` enforces consistent style across all `.tf` files. `validate` checks syntax and references without calling AWS — should return `Success! The configuration is valid.`
+
 ![Terraform Validate](screenshoots/03-terraform-validate.png)
+
+```bash
+terraform plan -var="my_ip=$(curl -s https://checkip.amazonaws.com)/32"
+```
+
+Dry run — shows every resource the three modules (`vpc`, `security-group`, `ec2`) will create. Nothing changes yet.
 
 ```bash
 terraform apply -var="my_ip=$(curl -s https://checkip.amazonaws.com)/32"
 ```
 
-Calls the `vpc`, `security-group`, and `ec2` modules in order — creates VPC, subnet, IGW, route table, security group, key pair, and EC2 instance. Also writes `inventory.ini` automatically into `infra/ansible/`.
+Type `yes`. Creates:
+
+| Resource | Purpose |
+|----------|---------|
+| VPC | Private network in eu-west-1 |
+| Subnet | eu-west-1a — where EC2 lives |
+| Internet Gateway | Door between VPC and the internet |
+| Route Table | Sends internet traffic through the IGW |
+| Security Group | SSH (22) from your IP only, Flask (5000) from anywhere |
+| Key Pair | Uploads `keys/app.pub` to AWS |
+| EC2 Instance | Amazon Linux 2, t3.micro |
+| `infra/ansible/inventory.ini` | Written automatically with the real EC2 IP |
+
+At the end you'll see:
+
+```
+ansible_command = "cd ../ansible && ansible-playbook -i inventory.ini site.yml"
+ec2_public_ip   = "x.x.x.x"
+ssh_command     = "ssh -i ../../keys/app ec2-user@x.x.x.x"
+app_url         = "http://x.x.x.x:5000"
+```
 
 ![Terraform Apply Complete](screenshoots/04-terraform-apply-complete.png)
 
 ---
 
-### Stage 3 — Configure the Instance with Ansible
+### Stage 3 — Configure EC2 with Ansible
 
 Wait ~30 seconds for EC2 to finish booting, then:
 
@@ -226,21 +272,72 @@ cd ../ansible
 ansible-playbook -i inventory.ini site.yml
 ```
 
-Ansible connects over SSH and installs Docker, Docker Compose v2.29.1, and Git. All tasks run without `sudo docker` requirement — `ec2-user` is added to the docker group.
+`-i inventory.ini` — Ansible reads the EC2 IP Terraform just wrote into that file.
+`site.yml` — runs these tasks in order over SSH:
+
+| Task | What happens |
+|------|-------------|
+| Update all packages | `yum update -y` — patches the OS |
+| Install Docker and Git | `yum install -y docker git` — skipped if already installed |
+| Start and enable Docker | Starts now + auto-starts on reboot |
+| Add ec2-user to docker group | No `sudo` needed for docker commands |
+| Create CLI plugins directory | Where Compose binary will live |
+| Download Docker Compose v2.29.1 | Pinned — v5+ requires buildx which AL2 doesn't have |
+| Symlink docker-compose | Makes both `docker compose` and `docker-compose` work |
+| Verify Docker version | Smoke test — prints version |
+| Verify Compose version | Smoke test — prints version |
+
+Final line should be:
+
+```
+PLAY RECAP
+x.x.x.x : ok=11   changed=7    unreachable=0    failed=0
+```
+
+`failed=0` is what matters.
 
 ![Ansible Playbook Complete](screenshoots/12-ansible-playbook-complete.png)
 
 ---
 
-### Stage 4 — Run Locally First (Verify Before EC2)
+### Stage 4 — Test Locally First
 
-Before deploying to EC2, verify the app works on your local machine:
+Before touching EC2, verify the app works on your machine:
 
 ```bash
-cd ..   # back to project root
+cd ../..    # back to project root
+cp .env.example .env
+nano .env
+```
+
+Fill in real values:
+
+```
+DB_NAME=appdb
+DB_USER=appuser
+DB_PASSWORD=yourpassword
+MYSQL_ROOT_PASSWORD=yourrootpassword
+```
+
+`Ctrl+O` to save, `Ctrl+X` to exit.
+
+```bash
 docker compose up --build -d
+```
+
+What happens:
+
+1. Docker builds the Flask image from `web/Dockerfile`
+2. Pulls `mysql:8.0` from Docker Hub
+3. Starts `db` — MySQL creates `appdb`, runs `init.sql` (creates `users` table, seeds Alice/Bob/Carol)
+4. Health check runs every 10 seconds — waits for MySQL to be ready
+5. Only after `db` is healthy, starts `web` — Flask connects to MySQL
+
+```bash
 docker compose ps
 ```
+
+Both services should show `Up (healthy)`.
 
 ![Local Compose Up and PS](screenshoots/06-local-compose-up-ps.png)
 
@@ -251,17 +348,30 @@ curl http://localhost:5000/users
 curl http://localhost:5000/users/1
 ```
 
+Expected:
+
+```json
+{ "status": "ok", "message": "Multi-container Flask + MySQL app..." }
+{ "status": "healthy", "database": "connected" }
+{ "count": 3, "users": [{ "id": 1, "name": "Alice Martin", ... }] }
+{ "id": 1, "name": "Alice Martin", "email": "alice@example.com" }
+```
+
 ![Local Curl Responses](screenshoots/07-local-curl-responses.png)
 
 ```bash
 docker compose logs
 ```
 
+Shows MySQL startup + Flask request logs with 200 status codes per request.
+
 ![Local Compose Logs](screenshoots/08-local-compose-logs.png)
 
 ```bash
 docker compose down --volumes
 ```
+
+Stops everything, removes containers, removes the `db-data` volume. Clean slate.
 
 ---
 
@@ -278,7 +388,7 @@ Inside EC2:
 git clone https://github.com/cedrick13bienvenue/multi-container-app-on-ec2
 cd multi-container-app-on-ec2
 cp .env.example .env
-nano .env    # fill in real passwords
+nano .env    # fill in the same passwords as locally
 docker compose up --build -d
 ```
 
@@ -288,6 +398,8 @@ docker compose up --build -d
 docker compose ps
 ```
 
+Both services should show `Up (healthy)`.
+
 ![EC2 Compose PS](screenshoots/10-ec2-compose-ps.png)
 
 ```bash
@@ -295,14 +407,23 @@ curl http://localhost:5000
 curl http://localhost:5000/health
 curl http://localhost:5000/users
 curl http://localhost:5000/users/1
+```
+
+![EC2 Curl Responses and Compose Down](screenshoots/13-ec2-curl-compose-down.png)
+
+```bash
 docker compose logs
 ```
 
 ![EC2 Compose Logs](screenshoots/11-ec2-compose-logs.png)
 
-![EC2 Curl Responses and Compose Down](screenshoots/13-ec2-curl-compose-down.png)
+From your local machine, you can also hit the API directly using the EC2 public IP:
 
-You can also hit the API directly from the browser using the EC2 public IP:
+```bash
+curl http://$(terraform output -raw ec2_public_ip):5000/users
+```
+
+Or open it in the browser:
 
 ```
 http://<ec2_public_ip>:5000/users
@@ -312,17 +433,23 @@ http://<ec2_public_ip>:5000/users
 
 ---
 
-### Stage 6 — Teardown
+### Stage 6 — Teardown (Reverse Order)
 
 ```bash
 # On EC2
 docker compose down --volumes
 exit
+```
 
-# On local machine — destroy EC2 infrastructure
+```bash
+# Back on local machine — destroy EC2 infrastructure
 cd infra/terra-modules
 terraform destroy -var="my_ip=$(curl -s https://checkip.amazonaws.com)/32"
+```
 
+Type `yes`. Destroys EC2, VPC, subnet, IGW, route table, security group, key pair. AWS billing stops immediately.
+
+```bash
 # Destroy the backend last
 cd ../backend
 terraform destroy
