@@ -2,7 +2,7 @@
 
 ## Overview
 
-This lab solves a classic production problem: **how do you run an application and its database as isolated, reproducible services that start and stop together, with zero manual wiring?**
+This lab solves a production problem: **how do you run an application and its database as isolated, reproducible services that start and stop together, with zero manual wiring?**
 
 A single EC2 instance running a bare app process is fragile — the database URL is hardcoded, the process dies on reboot, and there is no clear boundary between app and data. This project addresses that by combining three tools:
 
